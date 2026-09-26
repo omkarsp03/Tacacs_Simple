@@ -1,0 +1,566 @@
+TACACS+ AND THIS GO PROJECT
+============================
+
+This guide starts with the basics and then explains the complete flow of the
+project in this repository.
+
+1. WHAT IS TACACS+
+-------------------
+
+TACACS+ means Terminal Access Controller Access-Control System Plus. It is a
+network security protocol used to control and record access to network devices
+and other systems.
+
+A network device, such as a router, switch, firewall, VPN concentrator, or
+wireless controller, usually does not need to store every administrator's
+password locally. Instead, it can ask a central TACACS+ server to verify a
+login and, in a larger deployment, ask the server what the user is allowed to
+do.
+
+The two most important participants are:
+
+- TACACS+ client: The network device or application requesting authentication.
+- TACACS+ server: The central service that checks credentials and returns a
+  decision.
+
+In this repository, cmd/client acts as the TACACS+ client and cmd/server acts
+as the TACACS+ server. They are simple demonstration programs, not a complete
+production AAA system.
+
+AAA means:
+
+- Authentication: Who is the user?
+- Authorization: What is the user allowed to do?
+- Accounting: What did the user do, and when?
+
+TACACS+ separates these three functions into different packet types:
+
+- Authentication packets: Type 0x01
+- Authorization packets: Type 0x02
+- Accounting packets: Type 0x03
+
+This project implements only Authentication packets for an ASCII login.
+
+2. WHICH PORT DOES TACACS+ USE?
+--------------------------------
+
+TACACS+ uses TCP port 49 by default. TCP is used because TACACS+ needs a
+reliable, ordered connection for its request and response packets.
+
+Port 49 is a privileged port on many operating systems. On Unix-like systems,
+including macOS, listening on a port below 1024 may require elevated
+permissions. For local testing, this project can use a high port such as 5049:
+
+    go run ./cmd/server -addr :5049 -secret testing123
+    go run ./cmd/client -addr 127.0.0.1:5049 -secret testing123
+
+The port is only the network endpoint. The shared secret is a separate value
+used by TACACS+ to obfuscate packet bodies.
+
+3. WHERE IS TACACS+ USED?
+--------------------------
+
+TACACS+ is commonly used for centralized administrative access to:
+
+- Routers and switches
+- Firewalls
+- VPN and remote-access devices
+- Wireless controllers
+- Network management platforms
+- Data-center and infrastructure equipment
+- Command-line login systems that need centralized control
+
+A typical example is an administrator connecting to a switch over SSH. The
+switch is the TACACS+ client. The switch sends the username and authentication
+information to a TACACS+ server. The server checks a local database, LDAP,
+Active Directory, or another identity system and responds with success or
+failure.
+
+TACACS+ is especially useful for network administration because a deployment
+can centralize user management, apply authorization policies, and keep
+accounting records.
+
+4. HOW CLIENT AND SERVER COMMUNICATE
+-------------------------------------
+
+The client and server communicate over one TCP connection. TCP provides:
+
+- A connection-oriented channel
+- Reliable delivery
+- Ordered bytes
+- Retransmission when packets are lost
+- A stream on which TACACS+ packets are framed
+
+TACACS+ itself supplies the packet boundaries. Every packet has:
+
+    12-byte header + body
+
+The header contains:
+
+- Version: The TACACS+ protocol version byte
+- Type: Authentication, authorization, or accounting
+- Sequence number: The packet's position in the exchange
+- Flags: For example, unencrypted or single-connect flags
+- Session ID: A 32-bit identifier shared by packets in one exchange
+- Length: The body length in bytes
+
+The body contains the data for that packet type. In this project the body is
+usually obfuscated before transmission using an MD5-derived pseudo-pad and XOR.
+The receiver reverses the same operation to recover the body.
+
+Important security note: The packet-body mechanism implemented here is the
+TACACS+ protocol obfuscation mechanism, not modern general-purpose encryption.
+The shared secret must be protected, and production deployments should use a
+properly secured network path and a complete, maintained TACACS+ implementation.
+The project also uses MD5 as required by the historical TACACS+ body
+obfuscation algorithm; this does not make MD5 suitable for new cryptographic
+designs.
+
+5. PACKET DIRECTIONS AND PACKET TYPES
+-------------------------------------
+
+For the authentication flow in this project:
+
+    Client -> Server: START
+    Server -> Client: REPLY
+    Client -> Server: CONTINUE
+    Server -> Client: REPLY
+    Client -> Server: CONTINUE
+    Server -> Client: REPLY
+
+More specifically:
+
+A. START packet: client to server
+
+The client begins authentication with an AuthenStart body. It includes:
+
+- Action, normally Login
+- Privilege level
+- Authentication type, here ASCII
+- Authentication service, here Login
+- Username, which may be empty
+- Port or access method, here cli
+- Remote address, here 127.0.0.1
+- Optional data
+
+The first packet uses sequence number 1 in this project.
+
+B. REPLY packet: server to client
+
+The server answers a START or CONTINUE with an AuthenReply body. It includes:
+
+- Status, such as GETUSER, GETPASS, PASS, FAIL, or ERROR
+- Flags, such as NOECHO for a password prompt
+- A server message, such as "Username: "
+- Optional data
+
+C. CONTINUE packet: client to server
+
+The client sends an AuthenContinue body after a prompt. It includes:
+
+- Flags, including ABORT if the client stops the exchange
+- A user message, used by this project for the entered username or password
+- Optional data
+
+D. Authorization and accounting packets
+
+TACACS+ also defines authorization and accounting packet types. This project
+has constants for their type numbers in tacacs/packet.go, but it does not
+implement their bodies or flows.
+
+6. AUTHENTICATION STATUSES USED HERE
+-------------------------------------
+
+The server can send these authentication statuses:
+
+- GETUSER: Ask the client for a username.
+- GETPASS: Ask the client for a password.
+- GETDATA: Ask the client for other data.
+- PASS: Authentication succeeded.
+- FAIL: Authentication failed.
+- ERROR: The server could not process the request.
+
+The project also declares other TACACS+ status values such as RESTART and
+FOLLOW, but the client does not implement a complete flow for them.
+
+The password reply uses the NOECHO flag. This tells a capable client not to
+echo the password while it is being entered. The demonstration client does
+not actually disable terminal echo, so the password is visible while typing.
+That is intentionally called out in the source comments and is not suitable
+for a real login client.
+
+7. COMPLETE FLOW OF THIS PROJECT
+--------------------------------
+
+The following assumes that both programs use the same shared secret and that
+the client starts without a username argument.
+
+Step 1: Start the server
+
+The server parses -addr and -secret flags, then calls net.Listen with TCP.
+The default address in this project is :5049, while TACACS+'s registered port
+is :49. It accepts connections forever. Each accepted connection is handled
+in a separate goroutine, so multiple clients can be served concurrently.
+
+Step 2: Start the client
+
+The client parses -addr, -secret, and optional -user flags. It calls
+net.Dial("tcp", address), creates a random 32-bit session ID, and prepares an
+ASCII Login AuthenStart body.
+
+Step 3: Client sends START
+
+The client creates a TACACS+ header:
+
+- Version: major version 0xc0 plus default minor version 0x00
+- Type: Authentication, 0x01
+- Sequence number: 1
+- Session ID: random value
+- Length: filled in by WritePacket
+
+It serializes AuthenStart and calls tacacs.WritePacket.
+
+Step 4: Server reads and validates START
+
+The server calls tacacs.ReadPacket. That function reads exactly 12 bytes for
+the header, parses it, checks that the body length is not above the 1 MiB
+sanity limit, reads exactly the body length, and deobfuscates the body when the
+unencrypted flag is not set.
+
+The server verifies that the packet type is Authentication and parses the body
+with ParseAuthenStart.
+
+Step 5: Server asks for a username
+
+If the START packet has an empty username, the server sends a REPLY with:
+
+- Sequence number 2
+- Status GETUSER
+- Message "Username: "
+
+The client reads that packet, prints the message, reads one line from stdin,
+removes the line ending, and sends a CONTINUE packet with sequence number 3.
+The username is stored in the CONTINUE UserMsg field.
+
+If the client was started with -user admin, the username is already in START,
+so this username prompt is skipped.
+
+Step 6: Server asks for a password
+
+The server sends a REPLY with the next sequence number and:
+
+- Status GETPASS
+- ReplyFlagNoEcho in the flags
+- Message "Password: "
+
+The client prints the prompt, reads the next input line, and sends a CONTINUE
+packet containing the password in UserMsg.
+
+Step 7: Server checks the credentials
+
+The server looks up the username in the in-memory users map:
+
+    admin -> cisco123
+    bob   -> password1
+
+If both the username and password match, the server sends a final REPLY with
+status PASS and the message "Authentication succeeded".
+
+Otherwise, it sends a final REPLY with status FAIL and the message
+"Authentication failed".
+
+Step 8: Client finishes
+
+The client reads the final REPLY. For PASS it prints Login OK. For FAIL it
+prints Login FAILED. For ERROR or an unexpected status it prints an error and
+stops. The TCP connection is then closed.
+
+The normal packet sequence is therefore:
+
+    1  Client -> Server  START
+    2  Server -> Client  REPLY GETUSER
+    3  Client -> Server  CONTINUE username
+    4  Server -> Client  REPLY GETPASS
+    5  Client -> Server  CONTINUE password
+    6  Server -> Client  REPLY PASS or FAIL
+
+When a username is supplied in START, the sequence is shorter:
+
+    1  Client -> Server  START with username
+    2  Server -> Client  REPLY GETPASS
+    3  Client -> Server  CONTINUE password
+    4  Server -> Client  REPLY PASS or FAIL
+
+8. HOW BODY OBFUSCATION WORKS IN THIS CODE
+-------------------------------------------
+
+The shared secret is not placed directly in a packet body. Instead, the code
+creates a pseudo-pad using repeated MD5 calculations. The input includes:
+
+- The 4-byte session ID
+- The shared secret
+- The packet version
+- The packet sequence number
+- The previous MD5 result for every block after the first
+
+The resulting bytes are XORed with the body. XOR is reversible, so applying
+the same operation again returns the original body.
+
+In packet.go:
+
+- pseudoPad creates the MD5-derived bytes.
+- Obfuscate XORs a body with that pad.
+- WritePacket obfuscates before writing when a key is present.
+- ReadPacket deobfuscates after reading when the packet is not marked
+  unencrypted.
+
+When the key is empty, WritePacket sets the unencrypted flag and sends the body
+without obfuscation. That mode is useful for testing only.
+
+9. WHAT EACH FILE DOES
+----------------------
+
+go.mod
+
+Declares the module name as tacplus and requires Go 1.21. There are no external
+module dependencies. All imports used by the project come from the Go standard
+library.
+
+README.md
+
+Provides the short project overview, build and run commands, implemented and
+unimplemented features, sample users, and possible future work.
+
+TACACS_PLUS_GUIDE.txt
+
+This document. It explains TACACS+ basics, the wire exchange, the repository
+flow, the files, the Go packages, and limitations.
+
+tacacs/packet.go
+
+Defines the low-level packet framing and common protocol values.
+
+- TypeAuthen, TypeAuthor, and TypeAcct identify packet categories.
+- FlagUnencrypted and FlagSingleConnect define header flags.
+- MajorVersion and MinorVersionDefault define the version used here.
+- Header represents the fixed 12-byte packet header.
+- Header.Bytes serializes the header using big-endian integers.
+- ParseHeader validates that at least 12 bytes exist and decodes the header.
+- pseudoPad creates the body-obfuscation pad.
+- Obfuscate encrypts or decrypts a body using XOR.
+- ReadPacket reads and deobfuscates one complete packet.
+- WritePacket obfuscates and writes one complete packet.
+
+tacacs/authen.go
+
+Defines and encodes the Authentication packet bodies.
+
+- Authentication action, type, service, status, reply flag, and continue flag
+  constants give names to protocol byte values.
+- AuthenStart represents the first client-to-server authentication body.
+- AuthenStart.Marshal serializes its fields and variable-length strings.
+- ParseAuthenStart validates and decodes a START body.
+- AuthenReply represents a server-to-client response body.
+- AuthenReply.Marshal serializes status, flags, message length, and data length.
+- ParseAuthenReply validates and decodes a REPLY body.
+- AuthenContinue represents a client response to a server prompt.
+- AuthenContinue.Marshal serializes a CONTINUE body.
+- ParseAuthenContinue validates and decodes a CONTINUE body.
+
+cmd/server/main.go
+
+Contains the executable TACACS+ server.
+
+- The users map is a small in-memory username-to-password store.
+- main parses flags and listens for TCP connections.
+- Each accepted connection is sent to handleConn in a goroutine.
+- handleConn logs the connection and runs one authentication session.
+- handleAuthenSession performs the ASCII login state machine.
+- readContinue reads and validates the next client CONTINUE packet and its
+  sequence number.
+- sendReply builds and writes an AuthenReply packet.
+
+This server handles one login per TCP connection. It does not implement
+single-connect multiplexing.
+
+cmd/client/main.go
+
+Contains the executable interactive TACACS+ client.
+
+- main parses flags.
+- net.Dial opens the TCP connection.
+- A random session ID is generated.
+- The client sends AuthenStart.
+- It loops over server replies.
+- For GETUSER, GETDATA, or GETPASS it reads input and sends AuthenContinue.
+- For PASS or FAIL it prints the result and exits.
+- It uses bufio.Reader and currently reads passwords with normal terminal echo.
+
+10. GO LIBRARIES USED BY THIS PROJECT
+-------------------------------------
+
+The project uses only the Go standard library. There is no third-party
+TACACS+ dependency.
+
+Standard-library packages used:
+
+- crypto/md5: Creates the MD5 values required by the TACACS+ pseudo-pad.
+- encoding/binary: Encodes and decodes big-endian integers in packet headers
+  and body lengths.
+- fmt: Formats errors, messages, and logs.
+- io: Reads exact byte counts from the TCP stream and writes packet bytes.
+- bufio: Reads interactive input line by line in the client.
+- flag: Parses command-line options.
+- log: Writes server and client diagnostic messages.
+- math/rand: Generates the demonstration session ID.
+- net: Provides TCP listening and dialing.
+- os: Provides standard input to the client.
+- strings: Removes CR and LF characters from entered lines.
+
+Why the standard library is enough here:
+
+- TCP support is already provided by net.
+- Packet serialization is small and can be written directly.
+- The protocol bodies have simple fixed and variable-length fields.
+- The repository is educational and intentionally shows the wire format.
+
+11. OTHER GO TACACS+ LIBRARY OPTIONS
+------------------------------------
+
+This project does not use these libraries, but a production project should
+research maintained options instead of automatically copying a small demo.
+Availability, API quality, license, supported RFC features, and maintenance
+status can change, so verify each project before adopting it.
+
+Possible categories include:
+
+A. Go TACACS+ client libraries
+
+These are useful when a Go application needs to authenticate against an
+existing TACACS+ server. They may implement client-side Authentication and may
+also support authorization or accounting depending on the library.
+
+B. Go TACACS+ server libraries
+
+These are useful when a Go service must accept TACACS+ requests. Check whether
+they support the exact authentication types, authorization AVPs, accounting,
+shared-secret handling, session behavior, and concurrency model required by
+the deployment.
+
+Examples found in the Go package index include:
+
+- github.com/nwaples/tacplus: a package described as supporting client and
+  server TACACS+ applications.
+- github.com/facebookincubator/tacquito: a TACACS+ project with client and
+  server examples.
+- github.com/vorlon001/tacacs-server-on-golang: includes a tacplus package,
+  LDAP-related packages, and server-oriented code.
+- github.com/josh23french/tacplus and github.com/josh23french/tacacs: older
+  TACACS+ packages and server code.
+- github.com/vitalvas/gotacacs: includes TACACS+ client and server examples,
+  including TLS examples in the repository.
+
+These names are options to investigate, not recommendations or dependencies
+of this project. A package index result does not prove that a library is
+production-ready. Check its source, release history, tests, license, support
+for RFC 8907 features, and compatibility with the current Go version before
+using it. Do not confuse the original TACACS protocol (RFC 1492) with
+TACACS+ (RFC 8907); some packages expose both or use similar names.
+
+C. General AAA or network-management libraries
+
+Some Go networking libraries support RADIUS, SSH, device APIs, or generic AAA
+features but are not TACACS+ implementations. A RADIUS library cannot be
+substituted for a TACACS+ library without changing the protocol and server
+configuration.
+
+D. Supporting libraries
+
+Even when a TACACS+ package is selected, a real service may separately use:
+
+- A terminal input package that hides passwords
+- A database driver or LDAP/Active Directory client
+- Structured logging
+- Configuration and secret-management packages
+- TLS, VPN, or network isolation tools around the service
+
+The important selection questions are:
+
+- Does it implement TACACS+ Authentication, Authorization, and Accounting?
+- Does it support ASCII, PAP, CHAP, and MSCHAP as needed?
+- Does it correctly handle packet sequence numbers and session IDs?
+- Does it support single-connect mode if required?
+- Is it tested against real network devices?
+- Is it actively maintained and compatible with the project's Go version?
+- Does its license fit the project?
+- Does it avoid exposing credentials in logs or terminal input?
+
+12. WHAT THIS PROJECT DOES NOT IMPLEMENT
+-----------------------------------------
+
+This repository is intentionally minimal. It does not currently implement:
+
+- PAP authentication
+- CHAP authentication
+- MSCHAP authentication
+- Authorization request and response bodies
+- Accounting start, stop, and watchdog records
+- Authorization attributes such as service=shell or priv-lvl=15
+- Single-connect mode for multiple sessions on one connection
+- A persistent credential database
+- LDAP or Active Directory integration
+- Secure hidden password input in the client
+- Production-grade authentication policy, auditing, rate limits, or secret
+  rotation
+
+The constants AuthenTypePAP and AuthenTypeCHAP are present, but the server
+rejects non-ASCII authentication types. Likewise, TypeAuthor and TypeAcct are
+defined for packet type values, but no authorization or accounting state
+machines are present.
+
+13. HOW TO BUILD AND RUN
+------------------------
+
+Build every package:
+
+    go build ./...
+
+Run the server on an unprivileged local port:
+
+    go run ./cmd/server -addr :5049 -secret testing123
+
+Run the client in another terminal:
+
+    go run ./cmd/client -addr 127.0.0.1:5049 -secret testing123
+
+Use one of the built-in accounts:
+
+    Username: admin
+    Password: cisco123
+
+Or skip the username prompt:
+
+    go run ./cmd/client -addr 127.0.0.1:5049 -secret testing123 -user admin
+
+The secret must match on both sides. If it does not, the body will be decoded
+with the wrong pad and parsing will fail or produce invalid data.
+
+14. SHORT SUMMARY
+-----------------
+
+TACACS+ is a TCP-based AAA protocol whose default port is 49. A client such as
+a router sends authentication packets to a central server. The server replies
+with prompts or a decision. The project implements a hand-written subset:
+
+    TCP connection
+      -> TACACS+ header
+      -> MD5-derived body obfuscation
+      -> Authentication START
+      -> REPLY prompts
+      -> CONTINUE username/password
+      -> REPLY PASS or FAIL
+
+The Go implementation is intentionally transparent. packet.go handles the
+wire framing and obfuscation, authen.go handles authentication bodies,
+cmd/server/main.go implements the server state machine, and cmd/client/main.go
+implements the interactive client.
